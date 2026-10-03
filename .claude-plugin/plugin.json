@@ -1,0 +1,38 @@
+{
+  "name": "blackhole",
+  "version": "0.1.0",
+  "description": "Algorithmic zero-cost compaction, observational memory and session recall (a port of pi-blackhole)",
+  "userConfig": {
+    "compaction": {
+      "type": "string",
+      "title": "Compaction mode",
+      "description": "auto: handle /compact and auto-compaction; manual: only /compact and /blackhole; off: leave compaction to Claude Code",
+      "default": "auto",
+      "options": ["auto", "manual", "off"]
+    },
+    "memory": {
+      "type": "boolean",
+      "title": "Observational memory",
+      "description": "Run the observer, reflector and dropper workers in the background",
+      "default": true
+    },
+    "workerModel": {
+      "type": "string",
+      "title": "Worker model",
+      "description": "Model used by the observer, reflector and dropper",
+      "default": "claude-haiku-4-5-20251001"
+    },
+    "observeAfterTokens": {
+      "type": "number",
+      "title": "Observe after tokens",
+      "description": "Unobserved conversation tokens that trigger an observer run",
+      "default": 8000
+    },
+    "observationsPoolMaxTokens": {
+      "type": "number",
+      "title": "Memory pool max tokens",
+      "description": "Observations and reflections above this size are pruned by the dropper",
+      "default": 6000
+    }
+  }
+}
