@@ -1,7 +1,7 @@
 {
   "name": "blackhole",
-  "version": "0.1.0",
-  "description": "Algorithmic zero-cost compaction, observational memory and session recall (a port of pi-blackhole)",
+  "version": "0.2.0",
+  "description": "Zero-cost deterministic compaction, typed observational memory and recall of everything compacted away (a port of pi-blackhole)",
   "userConfig": {
     "compaction": {
       "type": "string",

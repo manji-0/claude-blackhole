@@ -295,6 +295,7 @@ async function settingsText($: EngineInterface): Promise<string> {
     `observeAfterTokens: ${cfg.observeAfter}`,
     `observationsPoolMaxTokens: ${cfg.poolMax}`,
     `data: ${io.dir}`,
+    `cleanup: after a compaction, sessions idle over ${retentionDays((await $.settings.read()) as Record<string, unknown>)} days (Claude Code's cleanupPeriodDays)`,
     'Change them under /config (blackhole).',
   ].join('\n')
 }
