@@ -168,7 +168,9 @@ export const parseJson = (text: string): unknown => {
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
-const oneLine = (s: string): string => s.replace(/\s+/g, ' ').trim()
+/** Items are asked for under 200 characters; past this a runaway one is cut. */
+const ITEM_MAX_CHARS = 400
+const oneLine = (s: string): string => clip(s.replace(/\s+/g, ' ').trim(), ITEM_MAX_CHARS)
 
 // ── observer ─────────────────────────────────────────────────────────────
 
@@ -182,17 +184,17 @@ Reply with ONE JSON object and nothing else:
 {"observations":[{"kind":"constraint|lesson|decision|state|fact","content":"...","relevance":"critical|high|medium|low","sourceEntryIds":["<id>", "..."],"supersedes":["<memory id>", "..."]}]}
 
 Kinds, and how long each lives:
-- constraint: what the user requires, forbids or corrected ("always use pnpm", "do not commit without asking"). Kept.
-- lesson: what failed, why, and what works instead, as "lesson: <what fails> → <cause> → <what works instead>"; also how to build, test or type-check this project, and where tools and generated files live. Kept. The most valuable kind; never skip one.
-- decision: a choice made, with its rationale and the alternatives rejected, so it is not reopened. Kept.
-- state: where the work stands: the task in progress, what is done, what is next, open blockers. Only the newest few survive, so write it to stand alone.
-- fact: anything else worth knowing about the code or results. Dropped first; the raw history stays searchable.
+- constraint: what the user requires, forbids or corrected ("always use pnpm", "do not commit without asking"). Kept. Not what the code does or does not do yet (that is state or fact).
+- lesson: what failed, why, and what works instead, as "lesson: <what fails> → <cause> → <what works instead>"; also how to build, test or type-check this project, and where tools, scripts and generated files live. Kept. The most valuable kind; never skip one. Not a description of what was implemented (that is a fact).
+- decision: a choice made, with its rationale and the alternatives rejected, so it is not reopened. Kept. Not a result such as "tests pass" or "CI is green" (that is state).
+- state: where the work stands: the task in progress, what is done, what is next, open blockers, test and CI results. Only the newest few survive, so write it to stand alone.
+- fact: anything else worth knowing about the code or results, including what was implemented and where. Dropped first; the raw history stays searchable.
 
 Rules:
 - Record only NEW information from the chunk. Never restate what the memory already holds.
 - When an item changes or replaces a current memory item (a newer state, a revised decision, a test count that moved, a plan that was replaced, a thing that now exists), write the new item and list the old item's id in "supersedes". The old item is retired.
 - Every item cites the smallest exact set of source entry ids that support it, copied from the chunk. Never invent ids; items without valid ids are discarded.
-- One item per fact, one line of plain prose, no markdown, no kind or relevance inside the content.
+- One item per fact, one line of plain prose under 200 characters, no markdown, no kind or relevance inside the content. Name the identifier and the point; leave the details to the history.
 - Self-contained: no "option B", "the issue above", pronouns or conversation-internal labels. Keep stable identifiers verbatim: file paths with line numbers, function and package names, commit SHAs, error messages quoted exactly, numbers with units.
 - Preserve user assertions as assertions and questions as questions; quote the user's unusual terms.
 - Record outcomes, not requests. Skip workflow narration, routine test runs, pushes and session bookkeeping; a passing test count or a pushed commit is state at most.
@@ -291,7 +293,7 @@ Reply with ONE JSON object and nothing else:
 {"merged":[{"content":"...","relevance":"critical|high|medium|low","replaces":["<id>", "..."]}],"retire":["<id>", "..."]}
 
 Rules:
-- A merged item replaces the items listed in "replaces" (ids copied exactly, all of one kind); it keeps their sources. One line of plain prose, self-contained, identifiers verbatim, in the language of the items.
+- A merged item replaces the items listed in "replaces" (ids copied exactly, all of one kind); it keeps their sources. One line of plain prose under 200 characters, self-contained, identifiers verbatim, in the language of the items.
 - Retire only what is no longer true or useful; merging is preferred to retiring.
 - Empty arrays are a valid answer.`
 
@@ -325,7 +327,9 @@ export const applyConsolidation = (l: Ledger, reply: string, at: number, poolMax
     const relevance = RELEVANCE.includes(item.relevance as Relevance) ? (item.relevance as Relevance) : top
     const id = hashId(`o:${content}:${sources.join(',')}`)
     for (const o of same) by.set(o.id, id)
-    added.push({ id, kind, content, relevance, sources, at, supersedes: same.map(o => o.id) })
+    // The merged item is as old as the newest it replaces, not as old as the merge.
+    const latest = same.reduce((t, o) => Math.max(t, o.at), 0) || at
+    added.push({ id, kind, content, relevance, sources, at: latest, supersedes: same.map(o => o.id) })
   }
   for (const id of strings(json.retire)) if (open.has(id) && !by.has(id)) by.set(id, undefined)
   const next = retire(l, by)
@@ -357,11 +361,11 @@ export const fitBudgets = (l: Ledger, poolMax: number): Ledger => {
 export const unclassified = (l: Ledger): Observation[] => activeObservations(l).filter(o => o.unclassified)
 
 export const CLASSIFIER_SYSTEM = `You sort a coding assistant's memory items into kinds. Each kind lives differently:
-- constraint: what the user requires, forbids or corrected. Kept.
-- lesson: what failed, why, and what works instead; how to build, test or type-check the project. Kept.
-- decision: a choice made, with its rationale or the alternatives rejected. Kept.
-- state: progress: what is done, in progress or next; test counts, pushes, releases. Only the newest survive.
-- fact: anything else about the code or results, re-derivable from the code or history. Dropped first.
+- constraint: what the user requires, forbids or corrected. Kept. Not what the code does or does not do yet.
+- lesson: what failed, why, and what works instead; how to build, test or type-check the project. Kept. Not a description of what was implemented.
+- decision: a choice made, with its rationale or the alternatives rejected. Kept. Not a result such as passing tests or green CI.
+- state: progress: what is done, in progress or next; test counts, CI results, pushes, releases. Only the newest survive.
+- fact: anything else about the code or results, including what was implemented and where, re-derivable from the code or history. Dropped first.
 
 Reply with ONE JSON object and nothing else, giving every item id a kind: {"kinds":{"<id>":"<kind>", "...":"..."}}`
 

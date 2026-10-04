@@ -28,6 +28,20 @@ export type Io = {
   messages: () => Promise<readonly SessionMessage[]>
 }
 
+/** One entry past this is clipped harder, so no segment nears $.fs.read's limit. */
+const ENTRY_MAX_BYTES = 2_000_000
+const ENTRY_FALLBACK_CHARS = 8000
+
+const fitEntry = (e: Entry): Entry => {
+  if (bytes(JSON.stringify(e)) <= ENTRY_MAX_BYTES) return e
+  const cut = (v: unknown) => (typeof v === 'string' && v.length > ENTRY_FALLBACK_CHARS ? `${v.slice(0, ENTRY_FALLBACK_CHARS - 1)}…` : v)
+  return {
+    ...e,
+    text: cut(e.text) as string,
+    tools: e.tools.map(t => ({ ...t, text: cut(t.text) as string, input: Object.fromEntries(Object.entries(t.input).map(([k, v]) => [k, cut(v)])) })),
+  }
+}
+
 const segName = (n: number): string => `seg-${String(n).padStart(4, '0')}.json`
 
 let queue: Promise<unknown> = Promise.resolve()
@@ -76,7 +90,7 @@ export const archiveEntries = async (io: Io, entries: Entry[], now: number): Pro
   let size = bytes(JSON.stringify(seg))
   let count = meta.count
   for (const e of fresh) {
-    const stored: Entry = { ...e, index: count++, at: e.at ?? now }
+    const stored: Entry = fitEntry({ ...e, index: count++, at: e.at ?? now })
     const len = bytes(JSON.stringify(stored))
     if (seg.length > 0 && size + len > SEGMENT_MAX_BYTES) {
       await io.write(`${dir}/${segName(segments)}`, JSON.stringify(seg))

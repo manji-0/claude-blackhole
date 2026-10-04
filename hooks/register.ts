@@ -25,6 +25,7 @@ import {
   kindBudget,
   kindTokens,
   observerPrompt,
+  renderEntryForObserver,
   overBudgetKinds,
   parseObservations,
   poolTokens,
@@ -92,7 +93,8 @@ async function cycle($: EngineInterface, force: boolean): Promise<string> {
   let ledger = await serial(() => loadLedger(io))
   const observed = new Set(ledger.observed)
   const pending = (await serial(() => corpus(io))).filter(e => !observed.has(e.id))
-  const pendingTokens = pending.reduce((n, e) => n + estimateTokens(e.text) + e.tools.reduce((m, t) => m + estimateTokens(t.text) / 4, 0), 0)
+  // Counted as the observer reads them (results clipped), not as archived.
+  const pendingTokens = pending.reduce((n, e) => n + estimateTokens(renderEntryForObserver(e, cwd)), 0)
   const notes: string[] = []
   const failuresBefore = ledger.usage.failures
   const callsBefore = ledger.usage.calls

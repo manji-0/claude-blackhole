@@ -49,8 +49,10 @@ export const SUMMARY_SENTINEL = '[blackhole compaction summary]'
 
 export const isSummaryText = (text: string): boolean => text.startsWith(SUMMARY_SENTINEL)
 
-const TOOL_TEXT_MAX = 8000
-const INPUT_FIELD_MAX = 2000
+// Entries are archived whole for recall; these caps only bound a runaway
+// field. Every renderer (summary, observer, recall) clips on its own.
+const TOOL_TEXT_MAX = 32_000
+const INPUT_FIELD_MAX = 32_000
 
 const shrinkInput = (input: Record<string, unknown>): Record<string, unknown> => {
   const out: Record<string, unknown> = {}
@@ -179,10 +181,7 @@ export const extractGoals = (entries: Entry[]): string[] => {
       latestIndex = e.index
     }
   }
-  if (latest && latest.length > 0) {
-    goals.push(`[Scope change]${indexSuffix(latestIndex)}`)
-    for (const l of latest) goals.push(l + indexSuffix(latestIndex))
-  }
+  if (latest && latest.length > 0) for (const l of latest) goals.push(`[Scope change] ${l}${indexSuffix(latestIndex)}`)
   return goals.slice(0, 8)
 }
 
@@ -240,14 +239,136 @@ const pathOf = (input: Record<string, unknown>): string | undefined => {
 export const relativize = (path: string, cwd?: string): string =>
   cwd && path.startsWith(`${cwd}/`) ? path.slice(cwd.length + 1) : path
 
+// ── shell commands ───────────────────────────────────────────────────────
+
+/**
+ * A shell command as simple commands (split on ; && || | and newlines), each
+ * a list of words with quotes respected and removed. Heredoc bodies are
+ * dropped; `<<EOF` stays as a word.
+ */
+export const shellCommands = (command: string): string[][] => {
+  const src = command.replace(/<<-?\s*(['"]?)(\w+)\1([^\n]*)\n[\s\S]*?\n\s*\2[ \t]*(?=\n|$)/g, (_m, _q, tag: string, rest: string) => `<<${tag}${rest}`)
+  const cmds: string[][] = []
+  let words: string[] = []
+  let word = ''
+  let inWord = false
+  let quote: string | undefined
+  const endWord = () => {
+    if (inWord) words.push(word)
+    word = ''
+    inWord = false
+  }
+  const endCommand = () => {
+    endWord()
+    if (words.length > 0) cmds.push(words)
+    words = []
+  }
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i] as string
+    if (quote) {
+      if (c === quote) quote = undefined
+      else if (c === '\\' && quote === '"' && i + 1 < src.length) word += src[++i]
+      else word += c
+      continue
+    }
+    if (c === "'" || c === '"') {
+      quote = c
+      inWord = true
+    } else if (c === '\\' && i + 1 < src.length) {
+      word += src[++i]
+      inWord = true
+    } else if (c === ';' || c === '\n') endCommand()
+    else if (c === '&' && src[i + 1] === '&') {
+      endCommand()
+      i++
+    } else if (c === '|') {
+      endCommand()
+      if (src[i + 1] === '|') i++
+    } else if (c === ' ' || c === '\t') endWord()
+    else {
+      word += c
+      inWord = true
+    }
+  }
+  endCommand()
+  return cmds
+}
+
+/** Words without leading `VAR=value` assignments. */
+const withoutEnv = (words: string[]): string[] => {
+  const i = words.findIndex(w => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w))
+  return i < 0 ? [] : words.slice(i)
+}
+
+/** A command's program, without its directory (`/usr/bin/grep` is grep). */
+const programOf = (words: string[]): string => words[0]?.split('/').pop() ?? ''
+
+/** Output redirect targets other than stderr and /dev/null (`> out.txt`, `>>log`). */
+const redirectTargets = (words: string[]): string[] => {
+  const out: string[] = []
+  words.forEach((w, i) => {
+    const m = w.match(/^([0-9]?)(>>?|&>)(.*)$/)
+    if (!m || m[1] === '2') return
+    const target = m[3] || words[i + 1] || ''
+    if (!target.startsWith('&') && target !== '/dev/null') out.push(target)
+  })
+  return out
+}
+
+/** A background task's output file: read to follow the task, not part of the work. */
+const isTaskOutput = (path: string): boolean => /\/tasks\/[^/]+\.output$/.test(path)
+
+/** Claude Code's own files (memory, task output) under ~/.claude are not the project's. */
+const isHarnessPath = (p: string): boolean => /^\/(?:Users|home)\/[^/]+\/\.claude\//.test(p)
+
+const plainPath = (p: string): boolean =>
+  p.length > 1 && /[/.]/.test(p) && !/[$*?{}()<>`|\\]/.test(p) && p !== '/dev/null' && !p.startsWith('-') && !isHarnessPath(p)
+
+/**
+ * Files a Bash command writes: redirects of cat/echo/printf, tee, sed -i, and
+ * Python scripts that write_text or open(.., "w") a literal path. A heuristic;
+ * an edit made some other way is missed.
+ */
+export const bashWrites = (command: string): string[] => {
+  const out = new Set<string>()
+  // A relative path is relative to where an earlier `cd` in the command went.
+  let dir: string | undefined
+  const add = (p: string | undefined) => {
+    if (!p) return
+    const full = dir && !p.startsWith('/') ? `${dir.replace(/\/$/, '')}/${p.replace(/^\.\//, '')}` : p
+    if (plainPath(full)) out.add(full)
+  }
+  for (const raw of shellCommands(command)) {
+    const words = withoutEnv(raw)
+    const prog = programOf(words)
+    if (prog === 'cd') {
+      const to = words[1]
+      dir = to?.startsWith('/') ? to : dir && to ? `${dir}/${to}` : undefined
+      continue
+    }
+    if (prog === 'cat' || prog === 'echo' || prog === 'printf') for (const t of redirectTargets(words)) add(t)
+    if (prog === 'tee') for (const w of words.slice(1)) if (!w.startsWith('-')) add(w)
+    if (prog === 'sed' && words.some(w => /^-[a-zA-Z]*i/.test(w)) && words.length > 2) add(words[words.length - 1])
+  }
+  if (/\.write_text\(|\bopen\([^)]*['"][wa]['"]/.test(command)) {
+    for (const m of command.matchAll(/\b(?:Path|open)\(\s*(['"])([^'"]+)\1/g)) add(m[2])
+  }
+  return [...out]
+}
+
 export const extractFiles = (entries: Entry[], cwd?: string): string[] => {
   const modified = new Set<string>()
   const created = new Set<string>()
   const read = new Set<string>()
   for (const e of entries) {
     for (const t of e.tools) {
+      if (t.isError) continue
+      if (t.name === 'Bash' && typeof t.input.command === 'string') {
+        for (const p of bashWrites(t.input.command)) modified.add(relativize(p, cwd))
+        continue
+      }
       const raw = pathOf(t.input)
-      if (!raw || t.isError) continue
+      if (!raw || isTaskOutput(raw) || isHarnessPath(raw)) continue
       const p = relativize(raw, cwd)
       if (WRITE_TOOLS.has(t.name)) {
         if (t.name === 'Write' && /created successfully/i.test(t.text) && !modified.has(p)) created.add(p)
@@ -273,12 +394,19 @@ export const extractFiles = (entries: Entry[], cwd?: string): string[] => {
 // ── commits ──────────────────────────────────────────────────────────────
 
 const COMMIT_MSG_RES = [
-  /git\s+commit\b[^\n]*?-m\s+"([^"]+)"/,
-  /git\s+commit\b[^\n]*?-m\s+'([^']+)'/,
-  /git\s+commit\b[\s\S]*?<<'?EOF'?\n([^\n]+)/,
+  // -m, or -m among short flags (-qm, -am).
+  /git\s+commit\b[^\n]*?\s-[a-zA-Z]*m\s+"([^"]+)"/,
+  /git\s+commit\b[^\n]*?\s-[a-zA-Z]*m\s+'([^']+)'/,
+  // -F - <<'EOF' (or -m "$(cat <<'EOF'"): the heredoc's first line, on the commit's own line.
+  /git\s+commit\b[^\n]*?<<-?\s*['"]?\w+['"]?\)?\s*\n\s*([^\n]+)/,
 ]
 const COMMIT_HASH_RE = /\[[^\]\s]+(?: \(root-commit\))? ([0-9a-f]{7,12})\]/
 
+/**
+ * Commits as their messages, read from the command; the hash only when git
+ * printed it (`-q` prints nothing). A commit whose message cannot be read is
+ * left out rather than guessed from output a hook may have printed.
+ */
 export const extractCommits = (entries: Entry[]): string[] => {
   const out: string[] = []
   const seen = new Set<string>()
@@ -287,9 +415,10 @@ export const extractCommits = (entries: Entry[]): string[] => {
       if (t.name !== 'Bash' || t.isError) continue
       const command = typeof t.input.command === 'string' ? t.input.command : ''
       if (!/\bgit\s+commit\b/.test(command)) continue
-      const message = COMMIT_MSG_RES.map(re => command.match(re)?.[1]).find(Boolean)
+      const message = COMMIT_MSG_RES.map(re => command.match(re)?.[1]?.trim().split('\n')[0]?.trim()).find(Boolean)
+      if (!message) continue
       const hash = t.text.match(COMMIT_HASH_RE)?.[1]
-      const line = `${hash ?? '(unknown)'} ${clip(message ?? firstLine(t.text, 80), 120)}`
+      const line = `${hash ? `${hash} ` : ''}${clip(message, 120)}`
       if (seen.has(line)) continue
       seen.add(line)
       out.push(line)
@@ -315,19 +444,54 @@ const pathTokens = (text: string): Set<string> => {
 // A failed command that only reads (grep, sed -n, ls, ...) is a lookup that went
 // wrong, not unfinished work, once a later command succeeded.
 const READ_ONLY_PROGRAMS = new Set(['cat', 'head', 'tail', 'less', 'sed', 'grep', 'rg', 'ag', 'find', 'fd', 'ls', 'tree', 'wc', 'sort', 'uniq', 'cut', 'jq', 'awk', 'echo', 'printf', 'pwd', 'which', 'file', 'stat', 'diff', 'cd', 'true'])
+/** What a Bash call runs, for matching a later retry: program and subcommand (`cargo test`, `git push`). */
+const commandKey = (command: string): string => {
+  const words = shellCommands(command)
+    .map(withoutEnv)
+    .find(w => w.length > 0 && w[0] !== 'cd')
+  if (!words) return ''
+  const sub = words[1]
+  return sub && /^[a-z][\w:-]*$/.test(sub) ? `${programOf(words)} ${sub}` : programOf(words)
+}
+
 const isReadOnly = (command: string): boolean =>
-  command
-    .split(/;|&&|\|\||\||\n/)
-    .map(seg => seg.trim().replace(/^([A-Za-z_][A-Za-z0-9_]*=\S*\s*)+/, ''))
-    .filter(seg => seg.length > 0)
-    .every(seg => {
-      if (/^sed\b/.test(seg) && /\s-i\b/.test(seg)) return false
-      if (/[^2]>\s*[^&\s]/.test(seg.replace(/\/dev\/null/g, ''))) return false
-      return READ_ONLY_PROGRAMS.has(seg.split(/\s+/)[0] ?? '')
+  shellCommands(command)
+    .map(withoutEnv)
+    .filter(w => w.length > 0)
+    .every(w => {
+      if (programOf(w) === 'sed' && w.some(x => /^-[a-zA-Z]*i/.test(x))) return false
+      if (redirectTargets(w).length > 0) return false
+      return READ_ONLY_PROGRAMS.has(programOf(w))
     })
 
+/** Errors and user reports older than this many entries are almost always settled. */
+const OUTSTANDING_WINDOW = 60
+const DECLINED_RE = /user (doesn't|does not) want to proceed|rejected by the user|denied by the user|user declined/i
+const ERROR_LINE_RE = /error|fail|panic|exception|✘|denied|not found|cannot|can't|no such/i
+
+/** "0 failed", "no errors": counts and denials that report success. */
+const ZERO_RE = /\b(?:0|no|zero) (?:failed|failures?|errors?|warnings?)\b/gi
+const looksLikeError = (line: string): boolean => ERROR_LINE_RE.test(line.replace(ZERO_RE, ''))
+
+/**
+ * The line that says what went wrong, not the exit code or a stray output
+ * line; undefined when no line reads as an error (a grep that matched
+ * nothing, a pipeline whose last step exited non-zero).
+ */
+const errorLineOf = (text: string): string | undefined => {
+  const line = nonEmptyLines(text.replace(/^\s*Exit code \d+\s*\n/, '')).find(looksLikeError)
+  return line === undefined ? undefined : clip(line, 200)
+}
+const errorLine = (text: string): string =>
+  errorLineOf(text) ?? clip(nonEmptyLines(text.replace(/^\s*Exit code \d+\s*\n/, ''))[0] ?? '', 200)
+
+/**
+ * Unresolved trouble near the end: tool errors no later call settled, and
+ * problems the user reported. The assistant's own prose is not scanned; it
+ * mentions failures it is already fixing.
+ */
 export const extractOutstanding = (entries: Entry[]): string[] => {
-  type Outcome = { name: string; order: number; command?: string; paths: Set<string>; text: string }
+  type Outcome = { name: string; order: number; command?: string; key?: string; paths: Set<string>; text: string }
   const errors: Outcome[] = []
   const successes: Outcome[] = []
   const pending: { order: number; text: string }[] = []
@@ -340,31 +504,35 @@ export const extractOutstanding = (entries: Entry[]): string[] => {
     return true
   }
   let order = 0
-  for (const e of entries) {
+  for (const e of entries.slice(-OUTSTANDING_WINDOW)) {
     for (const t of e.tools) {
       const command = typeof t.input.command === 'string' ? t.input.command : undefined
-      const o = { name: t.name, order: order++, command, paths: pathTokens(t.text), text: t.text }
+      const o = { name: t.name, order: order++, command, key: command && commandKey(command), paths: pathTokens(t.text), text: t.text }
+      if (t.isError && DECLINED_RE.test(t.text)) continue
       ;(t.isError ? errors : successes).push(o)
     }
     const n = order++
+    if (e.role !== 'user') continue
     for (const line of nonEmptyLines(e.text)) {
       const scannable = line.replace(CJK_BENIGN_RE, '')
       if (!BLOCKER_RE.test(scannable) && !BLOCKER_CJK_RE.test(scannable)) continue
       if (line.length < (hasCjk(line) ? 3 : 15)) continue
       if (/^\s*[-*+>(]/.test(line) || !SENTENCE_START_RE.test(line)) continue
-      const text = e.role === 'user' ? `[user] ${clipSentence(line, 200)}` : clipSentence(line, 200)
-      if (push(n, text)) break
+      if (push(n, `[user] ${clipSentence(line, 200)}`)) break
     }
   }
   const isResolved = (err: Outcome): boolean =>
     (err.name === 'Bash' && err.command !== undefined && isReadOnly(err.command) && successes.some(s => s.name === 'Bash' && s.order > err.order)) ||
     successes.some(s => {
       if (s.name !== err.name || s.order <= err.order) return false
-      if (err.name === 'Bash') return s.command !== undefined && s.command === err.command
+      if (err.name === 'Bash') return s.command !== undefined && (s.command === err.command || (!!err.key && s.key === err.key))
       if (err.paths.size > 0 || s.paths.size > 0) return [...err.paths].some(p => s.paths.has(p))
       return true
     })
-  for (const err of errors) if (!isResolved(err)) push(err.order, `[${err.name}] ${firstLine(err.text.replace(/^\s*Exit code \d+\s*\n/, ''), 200)}`)
+  for (const err of errors) {
+    const line = errorLineOf(err.text)
+    if (line !== undefined && !isResolved(err)) push(err.order, `[${err.name}] ${line}`)
+  }
   pending.sort((a, z) => a.order - z.order)
   return pending.slice(-5).map(p => p.text)
 }
@@ -373,7 +541,6 @@ export const extractOutstanding = (entries: Entry[]): string[] => {
 
 const USER_BRIEF_TOKENS = 256
 const ASSISTANT_BRIEF_TOKENS = 200
-const TOOLS_PER_TURN = 8
 const BRIEF_MAX_LINES = 120
 
 const clipTokens = (text: string, tokens: number): string => {
@@ -420,35 +587,62 @@ export const toolOneLiner = (t: EntryTool, cwd?: string, detail = false): string
   return arg ? `${t.name}: ${clip(arg.replace(/\s+/g, ' '), 100)}` : t.name
 }
 
-export const buildBrief = (entries: Entry[], cwd?: string): string => {
+const NOTIFICATION_RE = /^\s*<task-notification>/
+const isNotification = (e: Entry): boolean => e.role === 'user' && NOTIFICATION_RE.test(e.text)
+const notificationText = (e: Entry): string =>
+  `task notification: ${clip(e.text.match(/<summary>([\s\S]*?)<\/summary>/)?.[1]?.trim() ?? 'a background task finished', 200)}`
+
+/** `mcp__dagayn__query_graph_tool` reads as `query_graph_tool`. */
+const shortToolName = (name: string): string => name.split('__').pop() ?? name
+
+/**
+ * The conversation's flow: what the user asked and the assistant said, each
+ * with its #N. The tool calls between them fold into one line of counts and
+ * the #N range to expand with recall; the current state lists the last ones.
+ */
+export const buildBrief = (entries: Entry[], _cwd?: string): string => {
   const lines: string[] = []
+  type Group = { from?: number; to?: number; counts: Map<string, number>; failed: number; total: number }
+  let group: Group | undefined
+  const flush = () => {
+    if (group && group.total > 0) {
+      const range = group.from === undefined ? '' : group.from === group.to ? ` #${group.from}` : ` #${group.from}–#${group.to}`
+      const names = [...group.counts].map(([n, c]) => (c > 1 ? `${n} ×${c}` : n)).join(', ')
+      lines.push(`  (${group.total} tool call${group.total > 1 ? 's' : ''}${range}: ${names}${group.failed > 0 ? `; ${group.failed} failed` : ''})`)
+    }
+    group = undefined
+  }
   for (const e of entries) {
     const tag = e.index !== undefined ? ` #${e.index}` : ''
+    if (isNotification(e)) {
+      flush()
+      lines.push(`[user${tag}] ${notificationText(e)}`)
+      continue
+    }
     if (e.role === 'user') {
+      flush()
       const text = clipTokens(e.text.replace(/<skill[^>]*name="([^"]+)"[\s\S]*?<\/skill>/g, '[skill: $1]'), USER_BRIEF_TOKENS)
       lines.push(`[user${tag}] ${text.replace(/\n+/g, ' ⏎ ')}`)
       continue
     }
-    if (e.text) lines.push(`[assistant${tag}] ${clipTokens(e.text, ASSISTANT_BRIEF_TOKENS).replace(/\n+/g, ' ⏎ ')}`)
-    const tools = e.tools.slice(-TOOLS_PER_TURN)
-    if (e.tools.length > tools.length) lines.push(`  (${e.tools.length - tools.length} earlier tool calls omitted)`)
-    let prev = ''
-    let count = 0
-    const flush = () => {
-      if (prev) lines.push(`  * ${prev}${count > 1 ? ` x${count}` : ''}`)
-    }
-    for (const t of tools) {
-      const one = toolOneLiner(t, cwd) + (t.isError ? ` → [tool_error] ${firstLine(t.text, 120)}` : '')
-      if (one === prev) {
-        count++
-        continue
-      }
+    if (e.text) {
       flush()
-      prev = one
-      count = 1
+      lines.push(`[assistant${tag}] ${clipTokens(e.text, ASSISTANT_BRIEF_TOKENS).replace(/\n+/g, ' ⏎ ')}`)
     }
-    flush()
+    if (e.tools.length === 0) continue
+    group ??= { counts: new Map(), failed: 0, total: 0 }
+    if (e.index !== undefined) {
+      group.from ??= e.index
+      group.to = e.index
+    }
+    for (const t of e.tools) {
+      const name = shortToolName(t.name)
+      group.counts.set(name, (group.counts.get(name) ?? 0) + 1)
+      group.total++
+      if (t.isError) group.failed++
+    }
   }
+  flush()
   return lines.join('\n')
 }
 
@@ -465,29 +659,57 @@ export const capBrief = (text: string, maxLines = BRIEF_MAX_LINES): string => {
 
 const STATE_USER_TOKENS = 600
 const STATE_ASSISTANT_TOKENS = 900
+const STATE_PROPOSAL_TOKENS = 500
 const STATE_TOOLS = 8
+/** Tool calls at the very end that also show the first line of their result. */
+const STATE_TOOL_RESULTS = 3
+/** A request this short ("go", "案Aで") answers the assistant's last proposal; show that too. CJK packs more per char. */
+const isThin = (text: string): boolean => text.trim().length <= (hasCjk(text) ? 20 : 40)
+
+const oneLineState = (text: string, tokens: number): string => clipTokens(text, tokens).replace(/\n+/g, ' ⏎ ')
 
 /**
  * The brief transcript clips every turn; the end of the conversation is what
- * the next turn continues from, so it is kept close to whole.
+ * the next turn continues from, so it is kept close to whole. A short request
+ * or a task notification means little alone, so the proposal it answers and
+ * the last request with substance come with it.
  */
 export const buildCurrentState = (entries: Entry[], cwd?: string): string[] => {
   const lastUser = entries.map(e => e.role).lastIndexOf('user')
   const out: string[] = []
   const u = entries[lastUser]
   if (u) {
-    out.push(`Last user request${u.index !== undefined ? ` (#${u.index})` : ''}: ${clipTokens(u.text, STATE_USER_TOKENS).replace(/\n+/g, ' ⏎ ')}`)
+    if (isNotification(u)) {
+      out.push(`Last event${indexSuffix(u.index)}: ${notificationText(u)}`)
+    } else {
+      out.push(`Last user request${indexSuffix(u.index)}: ${oneLineState(u.text, STATE_USER_TOKENS)}`)
+    }
+    if (isNotification(u) || isThin(u.text)) {
+      const before = entries.slice(0, lastUser)
+      const proposal = [...before].reverse().find(e => e.role === 'assistant' && e.text.trim())
+      if (proposal) out.push(`It answers the assistant's message${indexSuffix(proposal.index)}: ${oneLineState(proposal.text, STATE_PROPOSAL_TOKENS)}`)
+      const request = [...before]
+        .reverse()
+        .find(e => e.role === 'user' && !isNotification(e) && !isThin(e.text))
+      if (request) out.push(`Last substantive request${indexSuffix(request.index)}: ${oneLineState(request.text, STATE_USER_TOKENS)}`)
+    }
   }
   const after = entries.slice(lastUser + 1)
   const reply = [...after].reverse().find(e => e.role === 'assistant' && e.text.trim())
-  if (reply) {
-    out.push(`Last assistant reply${reply.index !== undefined ? ` (#${reply.index})` : ''}: ${clipTokens(reply.text, STATE_ASSISTANT_TOKENS).replace(/\n+/g, ' ⏎ ')}`)
-  }
+  if (reply) out.push(`Last assistant reply${indexSuffix(reply.index)}: ${oneLineState(reply.text, STATE_ASSISTANT_TOKENS)}`)
   const replyAt = reply ? after.indexOf(reply) : -1
-  const tools = after.slice(Math.max(replyAt, 0)).flatMap(e => e.tools)
-  for (const t of tools.slice(-STATE_TOOLS)) {
-    out.push(`Then: ${toolOneLiner(t, cwd)}${t.isError ? ` → [tool_error] ${firstLine(t.text.replace(/^\s*Exit code \d+\s*\n/, ''), 120)}` : ''}`)
-  }
+  const tools = after.slice(Math.max(replyAt, 0)).flatMap(e => e.tools).slice(-STATE_TOOLS)
+  // A read's first line (a line count, a file's first line) says nothing; a build's or test's does.
+  const tellsOutcome = (t: EntryTool): boolean =>
+    t.name === 'Bash' && typeof t.input.command === 'string' && !isReadOnly(t.input.command) && t.text.trim().length > 0
+  tools.forEach((t, i) => {
+    const result = t.isError
+      ? ` → [tool_error] ${errorLine(t.text)}`
+      : i >= tools.length - STATE_TOOL_RESULTS && tellsOutcome(t)
+        ? ` → ${firstLine(t.text, 160)}`
+        : ''
+    out.push(`Then: ${toolOneLiner(t, cwd)}${result}`)
+  })
   return out
 }
 
@@ -560,7 +782,8 @@ export const mergeSections = (prev: Sections | undefined, next: Sections): Secti
   return {
     sessionGoal,
     filesAndChanges: mergeFiles(prev.filesAndChanges, next.filesAndChanges),
-    commits: mergeList(prev.commits, next.commits, 8),
+    // Older summaries guessed "(unknown) <output line>" for commits they could not read.
+    commits: mergeList(prev.commits.filter(c => !c.startsWith('(unknown) ')), next.commits, 8),
     outstandingContext: next.outstandingContext.length > 0 ? next.outstandingContext : prev.outstandingContext,
     userPreferences: mergeList(prev.userPreferences, next.userPreferences, 15),
     currentState: next.currentState?.length ? next.currentState : (prev.currentState ?? []),

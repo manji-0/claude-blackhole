@@ -111,8 +111,8 @@ describe('VCC extraction', () => {
         { role: 'user', text: 'https://pi.dev/packages/pi-blackhole の仕組みを実装したい', toolUses: [] },
       ]),
     )
-    expect(goals.some(g => g.startsWith('[Scope change]'))).toBe(true)
-    expect(goals.some(g => g.startsWith('https://pi.dev/packages/pi-blackhole の仕組みを実装したい'))).toBe(true)
+    expect(goals.some(g => g.startsWith('[Scope change] https://pi.dev/packages/pi-blackhole の仕組みを実装したい'))).toBe(true)
+    expect(goals.every(g => g.replace(/\s*\(#\d+\)$/, '') !== '[Scope change]')).toBe(true)
   })
 
   test('a failed lookup followed by a working command is not outstanding', () => {
@@ -152,10 +152,141 @@ describe('VCC extraction', () => {
       ]),
       CWD,
     )
-    expect(state[0]).toContain('次はビルドも確認して')
-    expect(state[1]).toContain(long)
-    expect(state[2]).toBe('Then: Bash: ビルドする — `pnpm build` → [tool_error] error TS2304')
+    const line = (label: string) => state.find(l => l.startsWith(label))
+    expect(line('Last user request')).toContain('次はビルドも確認して')
+    expect(line('Last assistant reply')).toContain(long)
+    expect(line('Then:')).toBe('Then: Bash: ビルドする — `pnpm build` → [tool_error] error TS2304')
     expect(buildSections(toEntries(SESSION), CWD).currentState?.[0]).toContain('今後は必ず pnpm を使ってください')
+  })
+
+  test('a short request comes with the proposal it answers and the last real request', () => {
+    const state = buildCurrentState(
+      toEntries([
+        { role: 'user', text: 'ログイン画面のバリデーションを直して、メールアドレスの形式チェックも追加してほしい', toolUses: [] },
+        { role: 'assistant', text: '案A: 正規表現で検証する。案B: ライブラリを使う。どちらにしますか？', toolUses: [] },
+        { role: 'user', text: 'go', toolUses: [] },
+      ]),
+      CWD,
+    )
+    expect(state[0]).toBe('Last user request: go')
+    expect(state[1]).toContain('案A: 正規表現で検証する')
+    expect(state[2]).toContain('メールアドレスの形式チェック')
+  })
+
+  test('a task notification reads as an event, not a request', () => {
+    const state = buildCurrentState(
+      toEntries([
+        { role: 'user', text: 'CI を待ってから結果を教えて。失敗していたら原因も調べてください。', toolUses: [] },
+        { role: 'assistant', text: 'CI を待ちます。', toolUses: [] },
+        { role: 'user', text: '<task-notification>\n<task-id>b1</task-id>\n<summary>CI watcher finished</summary>\n</task-notification>', toolUses: [] },
+      ]),
+      CWD,
+    )
+    expect(state[0]).toBe('Last event: task notification: CI watcher finished')
+    expect(state.some(l => l.startsWith('Last substantive request') && l.includes('CI を待ってから'))).toBe(true)
+  })
+
+  test('reads a commit from its heredoc and leaves the hash out when git printed none', () => {
+    const commits = buildSections(
+      toEntries([
+        {
+          role: 'assistant',
+          text: '',
+          toolUses: [
+            use('c1', 'Bash', { command: "git add -A && git commit -q -F - <<'EOF'\nfeat: add the recall tool\n\nBody.\nEOF\ngit push -q" }, 'Incremental: 2 files updated'),
+            use('c2', 'Bash', { command: 'git commit -q --amend --no-edit && echo ok' }, 'ok'),
+            use('c3', 'Bash', { command: 'git add crates && git commit -qm "feat(cli): standalone build\n\nBody line."' }, ''),
+          ],
+        },
+      ]),
+      CWD,
+    ).commits
+    expect(commits).toEqual(['feat: add the recall tool', 'feat(cli): standalone build'])
+  })
+
+  test('a retry of the same command settles a failure, and assistant prose is not scanned', () => {
+    const outstanding = buildSections(
+      toEntries([
+        {
+          role: 'assistant',
+          text: 'The build failed because a type was missing.',
+          toolUses: [
+            use('o1', 'Bash', { command: 'cargo test -p core' }, 'Exit code 101\ntest result: FAILED', true),
+            use('o2', 'Bash', { command: '/usr/bin/grep -n foo src/lib.rs' }, 'Exit code 1\n', true),
+            use('o3', 'Bash', { command: 'cargo test -p core --lib' }, 'test result: ok'),
+          ],
+        },
+      ]),
+      CWD,
+    ).outstandingContext
+    expect(outstanding).toEqual([])
+  })
+
+  test('the brief folds tool calls into counts with their entry range', () => {
+    const brief = buildSections(
+      toEntries(SESSION).map((e, index) => ({ ...e, index })),
+      CWD,
+    ).briefTranscript
+    expect(brief).toContain('[assistant #2] メールの検証を追加しました。')
+    expect(brief).toContain('  (2 tool calls #2: Edit, Bash; 1 failed)')
+    expect(brief).not.toContain('* ')
+  })
+
+  test('a non-zero exit with no error in its output is not outstanding', () => {
+    const outstanding = buildSections(
+      toEntries([
+        {
+          role: 'assistant',
+          text: '',
+          toolUses: [
+            use('z1', 'Bash', { command: 'cargo test -p cli it::one 2>&1 | tail -3; grep -c TODO src/a.rs' }, 'Exit code 1\ntest result: ok. 1 passed; 0 failed; 0 ignored', true),
+            use('z2', 'Bash', { command: 'rg -n search_edges crates/' }, 'Exit code 2\ncrates/graph/src/edge_lookups.rs:157:    pub fn search_edges_by_target_name(', true),
+          ],
+        },
+      ]),
+      CWD,
+    ).outstandingContext
+    expect(outstanding).toEqual([])
+  })
+
+  test('lists files written through Bash and leaves out task output files', () => {
+    const files = buildSections(
+      toEntries([
+        {
+          role: 'assistant',
+          text: '',
+          toolUses: [
+            use('w1', 'Bash', { command: `cat > ${CWD}/scripts/parity.sh <<'EOF'\necho hi\nEOF` }, ''),
+            use('w2', 'Bash', { command: "python3 - <<'EOF'\nimport pathlib\np=pathlib.Path(\"src/lib.rs\")\np.write_text(p.read_text().replace('a','b'))\nEOF" }, ''),
+            use('w3', 'Bash', { command: "sed -i '' 's/old/new/' src/main.rs && cargo build 2>/dev/null" }, ''),
+            use('w4', 'Read', { file_path: '/private/tmp/claude-501/x/tasks/b1uoocbtd.output' }, 'done'),
+            use('w5', 'Bash', { command: "cd /tmp/fx && cat > a.ts <<'EOF'\nlet a = 1\nEOF" }, ''),
+            use('w6', 'Write', { file_path: '/Users/u/.claude/projects/p/memory/MEMORY.md', content: 'x' }, 'File created successfully'),
+          ],
+        },
+      ]),
+      CWD,
+    ).filesAndChanges
+    expect(files).toEqual(['Modified: scripts/parity.sh, src/lib.rs, src/main.rs, /tmp/fx/a.ts'])
+  })
+
+  test('the current state shows results only for calls whose result tells an outcome', () => {
+    const state = buildCurrentState(
+      toEntries([
+        { role: 'user', text: 'ビルドが通るか確認してから結果を教えてください', toolUses: [] },
+        {
+          role: 'assistant',
+          text: '確認します。',
+          toolUses: [
+            use('r1', 'Bash', { command: '/usr/bin/wc -l src/lib.rs', description: '行数を数える' }, '64 src/lib.rs'),
+            use('r2', 'Bash', { command: 'cargo build', description: 'ビルドする' }, 'Finished dev profile'),
+          ],
+        },
+      ]),
+      CWD,
+    )
+    expect(state).toContain('Then: Bash: 行数を数える — `/usr/bin/wc -l src/lib.rs`')
+    expect(state).toContain('Then: Bash: ビルドする — `cargo build` → Finished dev profile')
   })
 
   test('keeps a failure that was never fixed', () => {
@@ -404,7 +535,7 @@ describe('observational memory', () => {
     const l = stored(w)
     expect(w.prompts).toHaveLength(1)
     const merged = activeObservations(l).find(o => o.content === 'lesson: one rule covers l1 to l3')
-    expect(merged).toMatchObject({ kind: 'lesson', relevance: 'high', supersedes: ['l1', 'l2', 'l3'] })
+    expect(merged).toMatchObject({ kind: 'lesson', relevance: 'high', supersedes: ['l1', 'l2', 'l3'], at: 2 })
     expect(l.observations.find(o => o.id === 'l2')?.supersededBy).toBe(merged?.id)
     expect(kindTokens(l, 'lesson')).toBeLessThanOrEqual(kindBudget(200, 'lesson'))
   })

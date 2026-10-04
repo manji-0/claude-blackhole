@@ -55,8 +55,14 @@ export const parseQuery = (raw: string): ParsedQuery | { error: string } => {
   return { query: { kind: 'text', text }, page, scope }
 }
 
+/** An entry as searchable lines: string inputs (commands, scripts, file contents) keep their own lines. */
 const entryHaystack = (e: Entry): string =>
-  [e.text, ...e.tools.map(t => `${t.name} ${JSON.stringify(t.input)} ${t.text}`)].join('\n')
+  [
+    e.text,
+    ...e.tools.map(t =>
+      [t.name, ...Object.entries(t.input).map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`), t.text].join('\n'),
+    ),
+  ].join('\n')
 
 const label = (e: Entry): string => `#${e.index ?? '?'} [${e.id}] ${e.role}`
 
@@ -73,7 +79,7 @@ export const expandEntry = (e: Entry, cwd?: string): string => {
   for (const t of e.tools) {
     lines.push(`\n• ${toolOneLiner(t, cwd)}${t.isError ? ' (error)' : ''}`)
     const input = JSON.stringify(t.input)
-    if (input.length > 2) lines.push(`  input: ${clip(input, 1500)}`)
+    if (input.length > 2) lines.push(`  input: ${clip(input, EXPAND_TOOL_TEXT)}`)
     if (t.text) lines.push(clip(t.text, EXPAND_TOOL_TEXT))
   }
   return lines.join('\n')
