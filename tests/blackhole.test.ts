@@ -3,6 +3,7 @@ import type { MockClock } from 'claude-code/testing'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import type { Ledger, Observation } from '../hooks/memory'
+import { DEFAULT_RETENTION_DAYS, retentionDays, staleSessions } from '../hooks/cleanup'
 import { activeObservations, emptyLedger, fitBudgets, kindBudget, kindTokens, migrateLedger, parseJson, parseObservations } from '../hooks/memory'
 import { bm25 } from '../hooks/recall'
 import { searchTokens } from '../hooks/text'
@@ -538,5 +539,79 @@ describe('observational memory', () => {
     expect(merged).toMatchObject({ kind: 'lesson', relevance: 'high', supersedes: ['l1', 'l2', 'l3'], at: 2 })
     expect(l.observations.find(o => o.id === 'l2')?.supersededBy).toBe(merged?.id)
     expect(kindTokens(l, 'lesson')).toBeLessThanOrEqual(kindBudget(200, 'lesson'))
+  })
+})
+
+describe('cleanup', () => {
+  const ROOT = '/home/u/.claude/blackhole'
+  const ID = (n: number) => `${String(n).repeat(8)}-${String(n).repeat(4)}-${String(n).repeat(4)}-${String(n).repeat(4)}-${String(n).repeat(12)}`
+  const NOW = Date.UTC(2026, 9, 5)
+  const DAY = 86_400_000
+
+  /** Session directories as `{ id: newest file's age in days }`, plus what was removed. */
+  const engine = (on: On, ages: Record<string, number>, settings: Record<string, unknown> = {}) => {
+    const removed: string[] = []
+    const clock = mock.clock(on, { now: NOW })
+    mock.env(on, { HOME: '/home/u' })
+    on('session.id', () => ({ value: ID(1) }))
+    on('fs.exists', (_$, e) => ({ value: e.path === ROOT }))
+    on('settings.read', () => ({ value: settings }))
+    on('fs.list', (_$, e) => {
+      if (e.path === ROOT)
+        return { value: [...Object.keys(ages), 'notes'].map(name => ({ name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false })) }
+      const age = ages[e.path.slice(ROOT.length + 1)]
+      return { value: age === undefined ? [] : [{ name: 'ledger.json', kind: 'file' as const, size: 2, mtimeMs: NOW - age * DAY, isLink: false }] }
+    })
+    on('process.run', (_$, e) => {
+      removed.push(e.argv.join(' '))
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    })
+    on('ui.toast', () => ({ value: undefined }))
+    on('ui.log', () => ({ value: undefined }))
+    on('fs.read', () => ({ deny: 'ENOENT' }))
+    on('fs.write', () => ({ value: undefined }))
+    on('session.cwd', () => ({ value: CWD }))
+    on('session.messages', () => ({ value: [...SESSION] }))
+    return { removed, clock }
+  }
+
+  test('retention follows cleanupPeriodDays, else 30 days', () => {
+    expect(retentionDays({ cleanupPeriodDays: 7 })).toBe(7)
+    expect(retentionDays({})).toBe(DEFAULT_RETENTION_DAYS)
+    expect(retentionDays({ cleanupPeriodDays: 0 })).toBe(DEFAULT_RETENTION_DAYS)
+  })
+
+  test('only idle session directories are stale, never the current one', async () => {
+    const io = {
+      root: ROOT,
+      current: ID(1),
+      now: async () => NOW,
+      remove: async () => {},
+      list: async (path: string) =>
+        path === ROOT
+          ? [ID(1), ID(2), ID(3), ID(4), 'notes'].map(name => ({ name, kind: 'dir' as const, mtimeMs: 0 }))
+          : path.endsWith(ID(3))
+            ? [{ name: 'ledger.json', kind: 'file' as const, mtimeMs: NOW - 2 * DAY }]
+            : path.endsWith(ID(4))
+              ? []
+              : [{ name: 'ledger.json', kind: 'file' as const, mtimeMs: NOW - 40 * DAY }],
+    }
+    // ID(1) is current, ID(2) idle 40 days, ID(3) written 2 days ago, ID(4) empty; oldest first.
+    expect(await staleSessions(io, 30)).toEqual([`${ROOT}/${ID(4)}`, `${ROOT}/${ID(2)}`])
+  })
+
+  test('a compaction removes idle sessions after it is done', async ($, on) => {
+    const { removed, clock } = engine(on, { [ID(2)]: 40, [ID(3)]: 2 }, { cleanupPeriodDays: 30 })
+    await $.session.compact({ trigger: 'manual', messages: SESSION })
+    expect(removed).toEqual([])
+    await clock.settle()
+    expect(removed).toEqual([`rm -rf -- ${ROOT}/${ID(2)}`])
+  })
+
+  test('/blackhole cleanup reports what it removed', async ($, on) => {
+    const { removed } = engine(on, { [ID(2)]: 10 }, { cleanupPeriodDays: 7 })
+    const r = await $.command.run({ command: 'blackhole', args: 'cleanup' } as never)
+    expect(removed).toEqual([`rm -rf -- ${ROOT}/${ID(2)}`])
+    expect(r.text).toContain(`removed 1 idle session(s):\n${ROOT}/${ID(2)}`)
   })
 })

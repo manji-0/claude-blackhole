@@ -23,7 +23,7 @@ compacted context stays small without making old work unreachable.
 ## Commands
 
 - `/blackhole` — compact now. `/blackhole <instructions>` passes compaction instructions.
-  Also: `preview`, `settings`, `om-on`, `om-off`.
+  Also: `preview`, `settings`, `cleanup`, `om-on`, `om-off`.
 - `/blackhole-memory` — memory status: items per kind against their budget, and worker time (total, per call, last cycle). Also: `view`, `full`, `run`.
 - `/blackhole-recall <query>` — the recall tool from the prompt.
 - `/blackhole-export` — write the memory to a Markdown file.
@@ -53,6 +53,15 @@ To load it in every session (including ones the desktop app starts), set
 ```json
 { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/src/claude-blackhole" } }
 ```
+
+## Data and cleanup
+
+Session data lives under `~/.claude/blackhole/<session id>/`. After each compaction,
+blackhole removes the session directories no file was written in for Claude Code's
+`cleanupPeriodDays` (30 days when unset), so an archive goes when the transcript it came
+from does. The running session is never removed, nor anything not named by a session id.
+The plugin's file API cannot delete, so this runs `rm -rf` through `$.process.run`, which
+Claude Code offers in the CLI only. `/blackhole cleanup` runs it now.
 
 ## Development
 

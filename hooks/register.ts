@@ -6,8 +6,11 @@
 //     once enough conversation is unobserved; the consolidator merges lasting
 //     memory only when a kind outgrows its share of the pool.
 //   - mcp__blackhole__recall and /blackhole* commands search and show it all.
+//   - after a compaction, session directories idle past Claude Code's
+//     cleanupPeriodDays are removed (the plugin's fs cannot delete; rm can).
 import type { EngineInterface, PluginOptions, Register, SessionMessage } from 'claude-code'
 
+import type { CleanupIo } from './cleanup'
 import type { Ledger } from './memory'
 import type { Io } from './store'
 import {
@@ -34,6 +37,7 @@ import {
   takeChunk,
   unclassified,
 } from './memory'
+import { cleanup, retentionDays } from './cleanup'
 import { RECALL_DESCRIPTION, recall } from './recall'
 import { archiveEntries, corpus, loadLedger, loadSections, saveLedger, saveSections, serial } from './store'
 import { clip, estimateTokens, hashId } from './text'
@@ -68,6 +72,31 @@ async function ioOf($: EngineInterface): Promise<Io> {
     now: () => $.clock.now(),
     messages: () => $.session.messages(),
   }
+}
+
+/** Cleanup's view of the engine: the data root, listed by $.fs, removed with rm. */
+async function cleanupIoOf($: EngineInterface): Promise<CleanupIo> {
+  const root = `${(await $.env.get('HOME')) ?? '.'}/.claude/blackhole`
+  return {
+    root,
+    current: await $.session.id(),
+    list: path => $.fs.list(path),
+    remove: async path => {
+      // Only a directory directly under the root, whatever the caller passed.
+      const name = path.startsWith(`${root}/`) ? path.slice(root.length + 1) : ''
+      if (!name || name.includes('/') || name.startsWith('.')) throw new Error(`refusing to remove ${path}`)
+      const r = await $.process.run(['rm', '-rf', '--', path])
+      if (r.exitCode !== 0) throw new Error(`rm ${path}: ${r.stderr.trim()}`)
+    },
+    now: () => $.clock.now(),
+  }
+}
+
+/** Remove session data idle past the retention; resolves what was removed. */
+async function cleanupSessions($: EngineInterface): Promise<string[]> {
+  const io = await cleanupIoOf($)
+  if (!(await $.fs.exists(io.root))) return []
+  return cleanup(io, retentionDays((await $.settings.read()) as Record<string, unknown>))
 }
 
 // ── workers ──────────────────────────────────────────────────────────────
@@ -293,6 +322,14 @@ export const register: Register = (on, options) => {
     await serial(() => saveSections(io, { hash: hashId(text), sections }))
     const tokensBefore = messageTokens(e.messages)
     $.ui.toast(`blackhole: compacted ~${tokensBefore} → ~${estimateTokens(text)} tokens`)
+    // Old sessions' data goes after the compaction, off its path.
+    $.clock.after(0, () => {
+      cleanupSessions($)
+        .then(removed => {
+          if (removed.length > 0) $.ui.log(`blackhole: removed ${removed.length} idle session(s): ${removed.join(', ')}`)
+        })
+        .catch(err => $.ui.log(`blackhole: cleanup failed: ${String(err)}`))
+    })
     return { messages: [{ role: 'user', text, toolUses: [] }], tokensBefore }
   })
 
@@ -321,8 +358,8 @@ export const register: Register = (on, options) => {
     })
     await $.command.register({
       name: 'blackhole',
-      description: 'Compact now with blackhole (or: preview | settings | om-on | om-off)',
-      argumentHint: '[preview|settings|om-on|om-off|<instructions>]',
+      description: 'Compact now with blackhole (or: preview | settings | cleanup | om-on | om-off)',
+      argumentHint: '[preview|settings|cleanup|om-on|om-off|<instructions>]',
     })
     await $.command.register({ name: 'blackhole-memory', description: 'blackhole memory status (or: view | full | run)', argumentHint: '[view|full|run]' })
     await $.command.register({ name: 'blackhole-recall', description: 'Search the session history and memory', argumentHint: '<query>' })
@@ -342,6 +379,10 @@ export const register: Register = (on, options) => {
       return { text: `observational memory ${run.memoryOn ? 'on' : 'off'} for this session.` }
     }
     if (arg === 'settings') return { text: await settingsText($) }
+    if (arg === 'cleanup') {
+      const removed = await cleanupSessions($)
+      return { text: removed.length > 0 ? `removed ${removed.length} idle session(s):\n${removed.join('\n')}` : 'no idle session data to remove.' }
+    }
     if (arg === 'preview') return { text: (await compile($, await $.session.messages())).text }
     // $.session.compact rejects inside a dispatch the turn waits on: run it from a timer.
     $.clock.after(0, () => {
