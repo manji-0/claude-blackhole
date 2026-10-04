@@ -603,7 +603,7 @@ export const formatSummary = ({ sections, memory, instructions }: SummaryParts):
     SUMMARY_SENTINEL,
     'This session is being continued from a previous conversation. The summary below was extracted ' +
       'from the conversation by blackhole (deterministic, entry indices as #N); memory sections were ' +
-      'written by its observer and reflector.',
+      'written by its observer.',
   ]
   if (instructions?.trim()) parts.push(`[Compaction Instructions]\n${instructions.trim()}`)
   if (head.length > 0) parts.push(head.join('\n\n'))

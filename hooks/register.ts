@@ -2,34 +2,36 @@
 //   - session.compact: a deterministic VCC summary (no model call) plus the
 //     observational memory replaces the conversation; the raw messages are
 //     archived first, so nothing is lost to recall.
-//   - turn.complete: observer → reflector → dropper run in the background on
-//     the worker model once enough conversation is unobserved.
+//   - turn.complete: the observer runs in the background on the worker model
+//     once enough conversation is unobserved; the consolidator merges lasting
+//     memory only when a kind outgrows its share of the pool.
 //   - mcp__blackhole__recall and /blackhole* commands search and show it all.
 import type { EngineInterface, PluginOptions, Register, SessionMessage } from 'claude-code'
 
 import type { Ledger } from './memory'
 import type { Io } from './store'
 import {
-  DROPPER_SYSTEM,
+  CLASSIFIER_SYSTEM,
+  CONSOLIDATOR_SYSTEM,
+  KINDS,
   OBSERVER_SYSTEM,
-  REFLECTOR_SYSTEM,
   activeObservations,
-  activeReflections,
   addObservations,
-  applyDrops,
-  applyReflection,
-  dropToBudget,
-  dropperPrompt,
-  needsReflection,
+  applyClassification,
+  applyConsolidation,
+  classifierPrompt,
+  consolidatorPrompt,
+  fitBudgets,
+  kindBudget,
+  kindTokens,
   observerPrompt,
-  parseDrops,
+  overBudgetKinds,
   parseObservations,
   poolTokens,
-  reflectorPrompt,
   renderMemory,
   renderObservation,
-  renderReflection,
   takeChunk,
+  unclassified,
 } from './memory'
 import { RECALL_DESCRIPTION, recall } from './recall'
 import { archiveEntries, corpus, loadLedger, loadSections, saveLedger, saveSections, serial } from './store'
@@ -38,7 +40,6 @@ import { buildSections, formatSummary, isEmptySections, isSummaryText, mergeSect
 
 type Mode = 'auto' | 'manual' | 'off'
 
-const REFLECT_EVERY = 30
 const OBSERVER_CHUNK_MAX_TOKENS = 20000
 const RETRY_COOLDOWN_MS = 30_000
 const DEFAULT_MODEL = 'claude-haiku-4-5-20251001'
@@ -71,7 +72,9 @@ async function ioOf($: EngineInterface): Promise<Io> {
 // ── workers ──────────────────────────────────────────────────────────────
 
 async function complete($: EngineInterface, ledger: Ledger, system: string, prompt: string): Promise<string | undefined> {
+  const started = await $.clock.now()
   const r = await $.model.complete({ model: cfg.workerModel, system, prompt, maxTokens: 8000, effort: 'low', timeoutMs: 180_000 })
+  ledger.usage.ms += (await $.clock.now()) - started
   ledger.usage.calls++
   ledger.usage.input += r.usage.input_tokens
   ledger.usage.output += r.usage.output_tokens
@@ -81,7 +84,7 @@ async function complete($: EngineInterface, ledger: Ledger, system: string, prom
   return undefined
 }
 
-/** One observer → reflector → dropper cycle; `force` observes below the threshold. */
+/** One observer → consolidator cycle; `force` observes below the threshold. */
 async function cycle($: EngineInterface, force: boolean): Promise<string> {
   const io = await ioOf($)
   const cwd = await $.session.cwd()
@@ -92,6 +95,7 @@ async function cycle($: EngineInterface, force: boolean): Promise<string> {
   const pendingTokens = pending.reduce((n, e) => n + estimateTokens(e.text) + e.tools.reduce((m, t) => m + estimateTokens(t.text) / 4, 0), 0)
   const notes: string[] = []
   const failuresBefore = ledger.usage.failures
+  const callsBefore = ledger.usage.calls
   let isFailed = false
 
   if (pending.length > 0 && (force || pendingTokens >= cfg.observeAfter)) {
@@ -109,37 +113,53 @@ async function cycle($: EngineInterface, force: boolean): Promise<string> {
         break
       }
       ledger = addObservations(ledger, obs, chunk)
-      notes.push(`+${obs.length} observations`)
+      notes.push(`+${obs.length} items`)
       rest = rest.slice(chunk.length)
     }
   }
 
-  if (needsReflection(ledger, REFLECT_EVERY) || (force && activeObservations(ledger).some(o => !o.reflected))) {
-    $.ui.status('blackhole: reflecting…')
-    const reply = await complete($, ledger, REFLECTOR_SYSTEM, reflectorPrompt(ledger))
-    const next = reply === undefined ? undefined : applyReflection(ledger, reply, now)
+  // A ledger migrated from reflections gets its kinds settled once, before any budget applies.
+  if (unclassified(ledger).length > 0) {
+    $.ui.status(`blackhole: classifying ${unclassified(ledger).length} migrated items…`)
+    const reply = await complete($, ledger, CLASSIFIER_SYSTEM, classifierPrompt(ledger))
+    const next = reply === undefined ? undefined : applyClassification(ledger, reply)
     if (next) {
-      notes.push(`+${activeReflections(next).length - activeReflections(ledger).length} reflections`)
+      notes.push(`classified ${unclassified(ledger).length} migrated items`)
       ledger = next
     } else {
       isFailed = true
-      notes.push('reflector failed')
+      run.lastFailureAt = now
+      notes.push('classifier failed')
     }
   }
 
-  const over = poolTokens(ledger) - cfg.poolMax
-  if (over > 0) {
-    $.ui.status('blackhole: pruning memory…')
-    const before = activeObservations(ledger).length
-    const reply = await complete($, ledger, DROPPER_SYSTEM, dropperPrompt(ledger, over))
-    const ids = reply === undefined ? undefined : parseDrops(ledger, reply)
-    if (ids) ledger = applyDrops(ledger, ids)
-    ledger = dropToBudget(ledger, cfg.poolMax)
-    notes.push(`-${before - activeObservations(ledger).length} observations dropped`)
+  // A lasting kind over its share gets one consolidator pass; fitBudgets trims what is left.
+  const over = unclassified(ledger).length > 0 ? [] : overBudgetKinds(ledger, cfg.poolMax)
+  if (over.length > 0) {
+    $.ui.status(`blackhole: consolidating ${over.join(', ')}…`)
+    const reply = await complete($, ledger, CONSOLIDATOR_SYSTEM, consolidatorPrompt(ledger, cfg.poolMax))
+    const next = reply === undefined ? undefined : applyConsolidation(ledger, reply, now, cfg.poolMax)
+    if (next) {
+      notes.push(`consolidated ${over.join(', ')}: ${activeObservations(ledger).length} → ${activeObservations(next).length} items`)
+      ledger = next
+    } else {
+      isFailed = true
+      notes.push('consolidator failed')
+    }
   }
+  const before = activeObservations(ledger).length
+  ledger = fitBudgets(ledger, cfg.poolMax)
+  const trimmed = before - activeObservations(ledger).length
+  if (trimmed > 0) notes.push(`-${trimmed} items over their kind's budget`)
 
   // A clean cycle clears the error a past one left for /blackhole-memory.
   if (!isFailed && ledger.usage.failures === failuresBefore) ledger = { ...ledger, lastError: undefined }
+  const calls = ledger.usage.calls - callsBefore
+  if (calls > 0) {
+    const ms = (await $.clock.now()) - now
+    ledger = { ...ledger, lastCycle: { at: now, ms, calls } }
+    notes.push(`${calls} worker calls in ${(ms / 1000).toFixed(1)}s`)
+  }
   await serial(() => saveLedger(io, ledger))
   $.ui.status(undefined)
   return notes.join(', ') || 'nothing to observe'
@@ -187,6 +207,8 @@ async function compile($: EngineInterface, messages: readonly SessionMessage[], 
   })
 }
 
+const seconds = (ms: number): string => `${(ms / 1000).toFixed(1)}s`
+
 const messageTokens = (messages: readonly SessionMessage[]): number =>
   messages.reduce((n, m) => n + estimateTokens(m.text) + m.toolUses.reduce((k, u) => k + estimateTokens(u.text ?? ''), 0), 0)
 
@@ -199,28 +221,26 @@ async function recallFor($: EngineInterface, query: string): Promise<string> {
 async function memoryStatus($: EngineInterface, arg: string): Promise<string> {
   const io = await ioOf($)
   const ledger = await serial(() => loadLedger(io))
-  if (arg === 'view' || arg === 'full') {
-    const refl = arg === 'full' ? ledger.reflections : activeReflections(ledger)
-    const obs = arg === 'full' ? ledger.observations : activeObservations(ledger)
-    const mark = (d?: boolean) => (d ? ' (dropped)' : '')
-    return [
-      `Reflections (${refl.length})`,
-      ...refl.map(r => `- ${renderReflection(r)}${mark(r.dropped)}`),
-      '',
-      `Observations (${obs.length})`,
-      ...obs.map(o => `- ${renderObservation(o)}${mark(o.dropped)}`),
-    ].join('\n')
+  if (arg === 'view') return renderMemory(ledger) || '(memory is empty)'
+  if (arg === 'full') {
+    const mark = (o: Ledger['observations'][number]) =>
+      o.supersededBy ? ` (superseded by ${o.supersededBy})` : o.dropped ? ' (dropped)' : ''
+    return KINDS.map(k => {
+      const items = ledger.observations.filter(o => o.kind === k)
+      return `${k} (${items.length})\n${items.map(o => `- ${renderObservation(o)}${mark(o)}`).join('\n')}`
+    }).join('\n\n')
   }
   const all = await serial(() => corpus(io))
   const observed = new Set(ledger.observed)
   const pending = all.filter(x => !observed.has(x.id))
   return [
     `memory: ${run.memoryOn ? 'on' : 'off'}${run.running ? ' (running)' : ''}, worker ${cfg.workerModel}`,
-    `observations: ${activeObservations(ledger).length} active / ${ledger.observations.length} total`,
-    `reflections: ${activeReflections(ledger).length} active / ${ledger.reflections.length} total`,
-    `pool: ~${poolTokens(ledger)} / ${cfg.poolMax} tokens`,
+    `items: ${activeObservations(ledger).length} active / ${ledger.observations.length} total, pool ~${poolTokens(ledger)} / ${cfg.poolMax} tokens`,
+    ...KINDS.map(k => `  ${k}: ${activeObservations(ledger).filter(o => o.kind === k).length} (~${kindTokens(ledger, k)} / ${kindBudget(cfg.poolMax, k)} tokens)`),
     `history: ${all.length} entries, ${pending.length} unobserved (~${pending.reduce((n, x) => n + estimateTokens(x.text), 0)} tokens; observes at ${cfg.observeAfter})`,
     `worker calls: ${ledger.usage.calls} (${ledger.usage.failures} failed), tokens in ${ledger.usage.input} / out ${ledger.usage.output}`,
+    `worker time: ${seconds(ledger.usage.ms)} total, ${seconds(ledger.usage.ms / Math.max(1, ledger.usage.calls))} per call` +
+      (ledger.lastCycle ? `; last cycle ${seconds(ledger.lastCycle.ms)} for ${ledger.lastCycle.calls} calls` : ''),
     ledger.lastError ? `last error: ${ledger.lastError}` : '',
   ]
     .filter(Boolean)

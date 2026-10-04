@@ -7,7 +7,7 @@ import type { SessionMessage } from 'claude-code'
 
 import type { Ledger } from './memory'
 import type { Entry, Sections } from './vcc'
-import { emptyLedger } from './memory'
+import { migrateLedger } from './memory'
 import { toEntries } from './vcc'
 
 /** `ids` are the archived entries' ids (hashes of their keys), kept short for the read limit. */
@@ -110,7 +110,7 @@ export const corpus = async (io: Io, live?: readonly SessionMessage[]): Promise<
 }
 
 export const loadLedger = async (io: Io): Promise<Ledger> =>
-  ({ ...emptyLedger(), ...(await readJson<Partial<Ledger>>(io, `${io.dir}/ledger.json`, {})) })
+  migrateLedger(await readJson<Record<string, unknown>>(io, `${io.dir}/ledger.json`, {}))
 
 export const saveLedger = async (io: Io, ledger: Ledger): Promise<void> =>
   io.write(`${io.dir}/ledger.json`, JSON.stringify(ledger))

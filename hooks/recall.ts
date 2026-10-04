@@ -2,7 +2,7 @@
 // plus the live transcript) and the memory ledger.
 import type { Ledger } from './memory'
 import type { Entry } from './vcc'
-import { renderObservation, renderReflection } from './memory'
+import { renderObservation } from './memory'
 import { clip, searchTokens } from './text'
 import { relativize, toolOneLiner } from './vcc'
 
@@ -160,16 +160,21 @@ export const recall = (raw: string, { corpus, ledger, cwd }: RecallInput): strin
 
   if (query.kind === 'id') {
     const obs = ledger.observations.find(o => o.id === query.id)
-    const refl = ledger.reflections.find(r => r.id === query.id)
     if (obs) {
       const src = obs.sources.map(id => byId.get(id)).filter((e): e is Entry => e !== undefined)
+      const status = obs.supersededBy ? ` (superseded by ${obs.supersededBy})` : obs.dropped ? ' (dropped)' : ''
+      const replaced = (obs.supersedes ?? [])
+        .map(id => ledger.observations.find(o => o.id === id))
+        .filter(o => o !== undefined)
+        .map(o => `- ${renderObservation(o)}`)
       return cap(
-        [`Observation ${renderObservation(obs)}${obs.dropped ? ' (dropped)' : ''}`, 'Source entries:', ...src.map(e => expandEntry(e, cwd))].join('\n\n'),
+        [
+          `Memory item (${obs.kind}) ${renderObservation(obs)}${status}`,
+          ...(replaced.length > 0 ? [`Replaces:\n${replaced.join('\n')}`] : []),
+          'Source entries:',
+          ...src.map(e => expandEntry(e, cwd)),
+        ].join('\n\n'),
       )
-    }
-    if (refl) {
-      const src = refl.sources.map(id => ledger.observations.find(o => o.id === id)).filter(o => o !== undefined)
-      return cap([`Reflection ${renderReflection(refl)}`, 'Built from:', ...src.map(o => `- ${renderObservation(o)}`)].join('\n'))
     }
     const e = byId.get(query.id)
     return e ? cap(expandEntry(e, cwd)) : `recall: no memory item or entry has id ${query.id}.`
@@ -196,7 +201,6 @@ export const recall = (raw: string, { corpus, ledger, cwd }: RecallInput): strin
     scope === 'history'
       ? []
       : [
-          ...ledger.reflections.filter(r => !r.dropped).map(r => ({ ref: `r:${r.id}`, text: r.content, tokens: searchTokens(r.content) })),
           ...ledger.observations.filter(o => !o.dropped).map(o => ({ ref: `o:${o.id}`, text: o.content, tokens: searchTokens(o.content) })),
         ]
   const entryDocs: Doc[] =
@@ -204,13 +208,9 @@ export const recall = (raw: string, { corpus, ledger, cwd }: RecallInput): strin
 
   const render = (ref: string, at: number): string => {
     const [kind, id] = [ref.slice(0, 1), ref.slice(2)]
-    if (kind === 'r') {
-      const r = ledger.reflections.find(x => x.id === id)
-      return r ? `- reflection ${renderReflection(r)}` : ''
-    }
     if (kind === 'o') {
       const o = ledger.observations.find(x => x.id === id)
-      return o ? `- observation ${renderObservation(o)}` : ''
+      return o ? `- memory (${o.kind}) ${renderObservation(o)}` : ''
     }
     const e = byId.get(id)
     return e ? `- ${label(e)}: ${snippetAround(entryHaystack(e), at)}` : ''
@@ -245,7 +245,7 @@ query forms:
 - free text: BM25-ranked search over past messages, tool calls, results and memory (English or Japanese)
 - #N: expand entry N in full (indices appear as #N in the compaction summary)
 - #N:<text>: lines of entry N containing <text>
-- <12-hex id>: an observation or reflection with its source evidence, or an entry
+- <12-hex id>: a memory item with its source evidence and what it replaced, or an entry
 - /regex/flags: regex search
 - mode:file <path>: entries whose tool calls touched a path
 - filters: scope:all|history|memory, page:N

@@ -13,13 +13,13 @@
     "memory": {
       "type": "boolean",
       "title": "Observational memory",
-      "description": "Run the observer, reflector and dropper workers in the background",
+      "description": "Run the observer and consolidator workers in the background",
       "default": true
     },
     "workerModel": {
       "type": "string",
       "title": "Worker model",
-      "description": "Model used by the observer, reflector and dropper",
+      "description": "Model used by the memory workers",
       "default": "claude-haiku-4-5-20251001"
     },
     "observeAfterTokens": {
@@ -31,7 +31,7 @@
     "observationsPoolMaxTokens": {
       "type": "number",
       "title": "Memory pool max tokens",
-      "description": "Observations and reflections above this size are pruned by the dropper",
+      "description": "Memory size; each kind (constraint, lesson, decision, state, fact) has a share of it",
       "default": 6000
     }
   }

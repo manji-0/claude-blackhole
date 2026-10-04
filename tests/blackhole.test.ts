@@ -2,7 +2,8 @@ import type { On, SessionMessage } from 'claude-code'
 import type { MockClock } from 'claude-code/testing'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { parseJson, parseObservations } from '../hooks/memory'
+import type { Ledger, Observation } from '../hooks/memory'
+import { activeObservations, emptyLedger, fitBudgets, kindBudget, kindTokens, migrateLedger, parseJson, parseObservations } from '../hooks/memory'
 import { bm25 } from '../hooks/recall'
 import { searchTokens } from '../hooks/text'
 import { SUMMARY_SENTINEL, buildCurrentState, buildSections, toolOneLiner, extractGoals, extractPreferences, toEntries } from '../hooks/vcc'
@@ -47,7 +48,7 @@ const SESSION: SessionMessage[] = [
 type World = { files: Map<string, string>; prompts: string[]; toasts: string[]; clock: MockClock }
 
 /** The engine beneath the plugin: files in memory, one session, a scripted worker model. */
-const world = (on: On, messages: readonly SessionMessage[], reply: (prompt: string) => string): World => {
+const world = (on: On, messages: readonly SessionMessage[], reply: (prompt: string) => string, latencyMs = 0): World => {
   const clock = mock.clock(on, { now: Date.UTC(2026, 9, 3, 12, 0) })
   const w: World = { files: new Map(), prompts: [], toasts: [], clock }
   mock.env(on, { HOME: '/home/u' })
@@ -63,8 +64,9 @@ const world = (on: On, messages: readonly SessionMessage[], reply: (prompt: stri
   on('session.id', () => ({ value: 'sess1' }))
   on('session.cwd', () => ({ value: CWD }))
   on('session.messages', () => ({ value: [...messages] }))
-  on('model.complete', (_$, e) => {
+  on('model.complete', async (_$, e) => {
     w.prompts.push(e.prompt)
+    if (latencyMs > 0) await clock.sleep(latencyMs)
     const usage = { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
     return { value: { isAnswered: true as const, text: reply(e.prompt), usage } }
   })
@@ -273,7 +275,7 @@ describe('recall', () => {
 describe('observational memory', () => {
   const observe = (prompt: string): string => {
     const ids = [...prompt.matchAll(/\[Source entry id: ([0-9a-f]{12})\]/g)].map(m => m[1])
-    return JSON.stringify({ observations: [{ content: 'User requires pnpm for all commands.', relevance: 'critical', sourceEntryIds: ids.slice(0, 1) }] })
+    return JSON.stringify({ observations: [{ kind: 'constraint', content: 'User requires pnpm for all commands.', relevance: 'critical', sourceEntryIds: ids.slice(0, 1) }] })
   }
 
   test('observes in the background after a turn once over the threshold', { options: { observeAfterTokens: 10 } }, async ($, on) => {
@@ -299,5 +301,111 @@ describe('observational memory', () => {
     await w.clock.settle()
     const r = await $.session.compact({ trigger: 'manual', messages: SESSION })
     expect(r.messages?.[0]?.text).toContain('[critical] User requires pnpm for all commands.')
+  })
+
+  test('records how long the workers took', { options: { observeAfterTokens: 10 } }, async ($, on) => {
+    const w = world(on, SESSION, observe, 1500)
+    on('turn.complete', () => ({ text: '' }))
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
+    await w.clock.advance(1500)
+    const ledger = JSON.parse(w.files.get(`${DIR}/ledger.json`) ?? '{}') as Ledger
+    expect(ledger.usage.ms).toBe(1500)
+    expect(ledger.lastCycle).toEqual({ at: Date.UTC(2026, 9, 3, 12, 0), ms: 1500, calls: 1 })
+  })
+
+  const item = (id: string, kind: Observation['kind'], at: number, relevance: Observation['relevance'] = 'medium'): Observation => ({
+    id,
+    kind,
+    content: `Item ${id} about the project, long enough to count.`,
+    relevance,
+    sources: [],
+    at,
+  })
+  const ledgerOf = (...items: Observation[]): Ledger => ({ ...emptyLedger(), observations: items })
+  const seed = (w: World, l: Ledger) => w.files.set(`${DIR}/ledger.json`, JSON.stringify(l))
+  const stored = (w: World) => JSON.parse(w.files.get(`${DIR}/ledger.json`) ?? '{}') as Ledger
+
+  test('turns a ledger with reflections into one layer of items', () => {
+    const l = migrateLedger({
+      observations: [
+        { id: 'o1', content: 'lesson: tsc is not installed → use npx -p typescript tsc', relevance: 'high', sources: ['e1'], at: 1, reflected: true },
+        { id: 'o2', content: 'Tests pass.', relevance: 'low', sources: ['e2'], at: 2 },
+      ],
+      reflections: [{ id: 'r1', content: 'lesson: type-check with npx -p typescript tsc', sources: ['o1'], at: 3 }],
+      observed: ['e1', 'e2'],
+      usage: { calls: 4, input: 1, output: 1, failures: 0 },
+    })
+    expect(l.version).toBe(2)
+    expect(l.usage.ms).toBe(0)
+    expect(l.observations.find(o => o.id === 'o1')).toMatchObject({ kind: 'lesson', dropped: true, supersededBy: 'r1' })
+    expect(l.observations.find(o => o.id === 'o2')).toMatchObject({ kind: 'fact' })
+    expect(l.observations.find(o => o.id === 'r1')).toMatchObject({ kind: 'lesson', sources: ['e1'], supersedes: ['o1'] })
+    expect(activeObservations(l).map(o => o.id)).toEqual(['o2', 'r1'])
+    expect(activeObservations(l).every(o => o.unclassified)).toBe(true)
+  })
+
+  test('settles a migrated ledger\'s kinds before any budget applies', { options: { observationsPoolMaxTokens: 200 } }, async ($, on) => {
+    const legacy = Array.from({ length: 12 }, (_, n) => ({ id: `r${n}`, content: `Reflection ${n} about the project, long enough to count.`, sources: [], at: n }))
+    const kinds = Object.fromEntries(legacy.map(r => [r.id, r.id === 'r0' ? 'constraint' : 'decision']))
+    const w = world(on, SESSION, prompt => (prompt.includes('[r0]') ? JSON.stringify({ kinds }) : '{"observations":[]}'))
+    w.files.set(`${DIR}/ledger.json`, JSON.stringify({ observations: [], reflections: legacy, observed: [], usage: { calls: 0, input: 0, output: 0, failures: 0 } }))
+    on('turn.complete', () => ({ text: '' }))
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
+    await w.clock.settle()
+    const l = stored(w)
+    // The classifier, then the consolidator for decisions now over their share.
+    expect(w.prompts).toHaveLength(2)
+    expect(w.prompts[1]).toContain('## Decisions (about')
+    expect(l.version).toBe(2)
+    expect(l.observations.some(o => o.unclassified)).toBe(false)
+    expect(l.observations.find(o => o.id === 'r0')?.kind).toBe('constraint')
+    // Decisions past their share are trimmed now that their kind is known; the constraint fits.
+    expect(kindTokens(l, 'decision')).toBeLessThanOrEqual(kindBudget(200, 'decision'))
+    expect(activeObservations(l).map(o => o.id)).toContain('r0')
+  })
+
+  test('an item the observer marks as superseding retires the old one', { options: { observeAfterTokens: 10 } }, async ($, on) => {
+    const w = world(on, SESSION, prompt => {
+      const ids = [...prompt.matchAll(/\[Source entry id: ([0-9a-f]{12})\]/g)].map(m => m[1])
+      return JSON.stringify({ observations: [{ kind: 'state', content: 'Login validation is fixed.', sourceEntryIds: ids.slice(0, 1), supersedes: ['s1'] }] })
+    })
+    seed(w, ledgerOf(item('s1', 'state', 1)))
+    on('turn.complete', () => ({ text: '' }))
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
+    await w.clock.settle()
+    const l = stored(w)
+    const fresh = activeObservations(l).find(o => o.content === 'Login validation is fixed.')
+    expect(l.observations.find(o => o.id === 's1')).toMatchObject({ dropped: true, supersededBy: fresh?.id })
+    expect(fresh?.supersedes).toEqual(['s1'])
+  })
+
+  test('trims each kind to its share, lowest relevance and oldest first', () => {
+    const l = ledgerOf(item('f1', 'fact', 1, 'high'), item('f2', 'fact', 2, 'low'), item('f3', 'fact', 3), item('c1', 'constraint', 0, 'low'))
+    const budget = kindTokens(ledgerOf(item('x', 'fact', 0)), 'fact') * 2
+    const poolMax = Math.ceil(budget / 0.15)
+    expect(kindBudget(poolMax, 'fact')).toBeGreaterThanOrEqual(budget)
+    const fitted = fitBudgets(l, poolMax)
+    expect(activeObservations(fitted).map(o => o.id)).toEqual(['f1', 'f3', 'c1'])
+    expect(fitBudgets(ledgerOf(item('c1', 'constraint', 0)), poolMax)).toEqual(ledgerOf(item('c1', 'constraint', 0)))
+  })
+
+  test('consolidates a lasting kind over its share with one worker call', { options: { observationsPoolMaxTokens: 200 } }, async ($, on) => {
+    const lessons = ['l1', 'l2', 'l3', 'l4'].map((id, n) => item(id, 'lesson', n, 'high'))
+    const w = world(on, SESSION, prompt =>
+      prompt.includes('## Lessons (about')
+        ? JSON.stringify({ merged: [{ content: 'lesson: one rule covers l1 to l3', replaces: ['l1', 'l2', 'l3'] }], retire: [] })
+        : '{"observations":[]}',
+    )
+    // Below the observe threshold: the only call is the consolidator's.
+    seed(w, ledgerOf(...lessons, item('f1', 'fact', 9)))
+    on('turn.complete', () => ({ text: '' }))
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' })
+    await w.clock.settle()
+    const l = stored(w)
+    expect(w.prompts).toHaveLength(1)
+    const merged = activeObservations(l).find(o => o.content === 'lesson: one rule covers l1 to l3')
+    expect(merged).toMatchObject({ kind: 'lesson', relevance: 'high', supersedes: ['l1', 'l2', 'l3'] })
+    expect(l.observations.find(o => o.id === 'l2')?.supersededBy).toBe(merged?.id)
+    expect(kindTokens(l, 'lesson')).toBeLessThanOrEqual(kindBudget(200, 'lesson'))
   })
 })
